@@ -107,7 +107,7 @@ export default function Page() {
   };
 
   return (
-    <main className="container">
+    <main>
       <h1>W-9 Autofill</h1>
       <p className="lead">Upload a completed IRS Form W-9 and we&apos;ll prefill the fields below.</p>
 

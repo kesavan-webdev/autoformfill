@@ -55,3 +55,13 @@ button.secondary { background: #fff; color: #2563eb; }
 button:disabled { opacity: 0.6; cursor: not-allowed; }
 .error { color: #b91c1c; font-size: 14px; margin-top: 8px; }
 .status { color: #2563eb; font-size: 14px; margin-top: 8px; }
+.nav { display: flex; gap: 16px; margin-bottom: 20px; font-size: 14px; }
+.nav a { color: #2563eb; text-decoration: none; font-weight: 600; padding: 6px 10px; border-radius: 6px; }
+.nav a:hover { background: #eff6ff; }
+.nav a.active { background: #2563eb; color: #fff; }
+table.lines { width: 100%; border-collapse: collapse; font-size: 14px; }
+table.lines th, table.lines td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #eee; }
+table.lines th { font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.04em; }
+table.lines td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.subhead { margin: 18px 0 8px; font-size: 13px; font-weight: 700; color: #374151; text-transform: uppercase; letter-spacing: 0.04em; }
+

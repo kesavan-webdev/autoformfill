@@ -1,15 +1,21 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import Nav from "./components/Nav";
 
 export const metadata: Metadata = {
-  title: "W-9 Autofill",
-  description: "Upload a W-9 PDF and review the extracted fields.",
+  title: "Form Autofill",
+  description: "Upload W-9 or paystub PDFs and review the extracted fields.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        <div className="container">
+          <Nav />
+          {children}
+        </div>
+      </body>
     </html>
   );
 }
