@@ -1,6 +1,7 @@
 """PDF parsing API — W-9 and ADP-style paystubs."""
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -10,9 +11,12 @@ from parsers import parse_paystub, parse_w9
 
 app = FastAPI(title="Form Parser")
 
+_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000")
+allow_origins = [o.strip() for o in _origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=allow_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
