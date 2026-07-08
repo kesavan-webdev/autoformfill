@@ -16,6 +16,22 @@ from pypdf import PdfReader
 _AMOUNT = r"-?\$?[\d,]+\.\d{2}"
 
 
+def _dedupe(s: str) -> str:
+    """Collapse strings that are a whole-number repetition of a shorter prefix.
+
+    Why: pypdf extract_text on ADP paystubs concatenates overlapping text layers,
+    producing e.g. "Praveen BojankiPraveen BojankiPraveen BojankiPraveen Bojanki".
+    """
+    s = s.strip()
+    n = len(s)
+    if n < 2:
+        return s
+    for size in range(1, n // 2 + 1):
+        if n % size == 0 and s[:size] * (n // size) == s:
+            return s[:size].strip()
+    return s
+
+
 def _num(s: str | None) -> float | None:
     if not s:
         return None
@@ -120,10 +136,10 @@ def _parse_employee(text: str) -> dict[str, str]:
     if not m:
         return {"name": "", "address1": "", "address2": "", "cityStateZip": ""}
     return {
-        "name": m.group(1).strip(),
-        "address1": m.group(2).strip(),
-        "address2": (m.group(3) or "").strip(),
-        "cityStateZip": m.group(4).strip(),
+        "name": _dedupe(m.group(1)),
+        "address1": _dedupe(m.group(2)),
+        "address2": _dedupe(m.group(3) or ""),
+        "cityStateZip": _dedupe(m.group(4)),
     }
 
 
@@ -138,9 +154,9 @@ def _parse_company(text: str) -> dict[str, str]:
     # looks like an org (uppercase) followed by an address.
     org = re.search(r"\n([A-Z][A-Z0-9 &.,'-]{2,})\n(\d+[^\n]+)\n", text)
     return {
-        "code": code,
-        "name": (org.group(1).strip() if org else ""),
-        "address": (org.group(2).strip() if org else ""),
+        "code": _dedupe(code),
+        "name": _dedupe(org.group(1)) if org else "",
+        "address": _dedupe(org.group(2)) if org else "",
     }
 
 
