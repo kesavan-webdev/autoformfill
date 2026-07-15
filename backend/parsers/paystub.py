@@ -49,10 +49,29 @@ def _search(pattern: str, text: str, flags: int = 0) -> str:
     return m.group(1).strip() if m else ""
 
 
+_REPEAT_RE = re.compile(r"(.{3,}?)\1+")
+
+
+def _collapse_repeats(text: str) -> str:
+    """Collapse pypdf's overlaid-text duplicates, e.g. 'Gross PayGross Pay...' → 'Gross Pay'.
+
+    Why: pypdf's extract_text() concatenates overlapping text layers on ADP paystubs,
+    producing runs like 'Gross Pay $5,016.00$5,016.00$5,016.00$5,016.00 $44,664.00'
+    which breaks value regexes that expect a single this-period + a single YTD amount.
+    Requiring a minimum repeat length of 3 avoids collapsing legitimate digit runs.
+    """
+    return _REPEAT_RE.sub(r"\1", text)
+
+
 def _extract_text(data: bytes) -> str:
     reader = PdfReader(io.BytesIO(data))
-    parts = [page.extract_text() or "" for page in reader.pages]
+    parts = [_collapse_repeats(page.extract_text() or "") for page in reader.pages]
     return "\n".join(parts)
+
+
+def _extract_pages(data: bytes) -> list[str]:
+    reader = PdfReader(io.BytesIO(data))
+    return [_collapse_repeats(page.extract_text() or "") for page in reader.pages]
 
 
 def _parse_deductions(text: str) -> list[dict[str, Any]]:
@@ -92,7 +111,7 @@ def _parse_earnings(text: str) -> list[dict[str, Any]]:
         return []
     lines = block.group(0).splitlines()
     out: list[dict[str, Any]] = []
-    # Row formats vary: "Regular 0.00 5016.00 44664.00" (rate, this, ytd)
+    # Row formats vary: "Regular 0.00 5016.00 44664.00" (hours, this, ytd; rate blank)
     # or "Regular 25.00 80.00 2000.00 24000.00" (rate, hours, this, ytd)
     four_col = re.compile(rf"^(.+?)\s+({_AMOUNT})\s+({_AMOUNT})\s+({_AMOUNT})\s*$")
     five_col = re.compile(
@@ -116,8 +135,8 @@ def _parse_earnings(text: str) -> list[dict[str, Any]]:
         if m4:
             out.append({
                 "label": m4.group(1).strip(),
-                "rate": _num(m4.group(2)),
-                "hours": None,
+                "rate": None,
+                "hours": _num(m4.group(2)),
                 "thisPeriod": _num(m4.group(3)),
                 "ytd": _num(m4.group(4)),
             })
@@ -143,48 +162,116 @@ def _parse_employee(text: str) -> dict[str, str]:
     }
 
 
-def _parse_company(text: str) -> dict[str, str]:
-    """First non-header lines before 'Earnings Statement' typically hold employer."""
-    m = re.search(
-        r"Company Code\s*\n([^\n]+)\s*\n(?:Loc/Dept|Number|Page)?[^\n]*\n",
+def _parse_company(text: str) -> dict[str, Any]:
+    """Each header label appears on its own line, followed by its value.
+
+    Text order: `Company Code\n<code>\n<company name>\n<addr...>\nLoc/Dept\n<val>\n
+    Number\n<val>\nPage\n<val> Earnings Statement`.
+    """
+    code = _search(r"Company Code\s*\n([^\n]+)", text)
+    loc_dept = _search(r"Loc/Dept\s*\n([^\n]+)", text)
+    file_number = _search(r"Number\s*\n([^\n]+)", text)
+    page = _search(r"Page\s*\n(\d+\s+of\s+\d+)", text)
+
+    # Company name/address sits between the code value and "Loc/Dept" label.
+    block = re.search(
+        r"Company Code\s*\n[^\n]+\n(.*?)\nLoc/Dept",
         text,
+        re.DOTALL,
     )
-    code = m.group(1).strip() if m else ""
-    # Employer name appears after the header block; pull the first line that
-    # looks like an org (uppercase) followed by an address.
-    org = re.search(r"\n([A-Z][A-Z0-9 &.,'-]{2,})\n(\d+[^\n]+)\n", text)
+    name = ""
+    address_lines: list[str] = []
+    city_state_zip = ""
+    if block:
+        raw_lines = [ln.strip() for ln in block.group(1).splitlines() if ln.strip()]
+        if raw_lines:
+            name = _dedupe(raw_lines[0])
+            rest = [_dedupe(ln) for ln in raw_lines[1:]]
+            # Last line matching City, ST ZIP is the city/state/zip.
+            if rest and re.search(r",\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?", rest[-1]):
+                city_state_zip = rest[-1]
+                address_lines = rest[:-1]
+            else:
+                address_lines = rest
+
     return {
         "code": _dedupe(code),
-        "name": _dedupe(org.group(1)) if org else "",
-        "address": _dedupe(org.group(2)) if org else "",
+        "locDept": _dedupe(loc_dept),
+        "fileNumber": _dedupe(file_number),
+        "page": _dedupe(page),
+        "name": name,
+        "addressLines": address_lines,
+        "cityStateZip": city_state_zip,
     }
 
 
-def _parse_deposit(text: str) -> dict[str, Any]:
-    m = re.search(
+def _parse_deposits(text: str) -> list[dict[str, Any]]:
+    """Every 'Deposited to the account' row: type, method, account, routing, amount."""
+    out: list[dict[str, Any]] = []
+    for m in re.finditer(
         rf"(Checking|Savings)\s+(\S+)\s+(X+\d+)\s+(X+)\s+({_AMOUNT})",
         text,
+    ):
+        out.append({
+            "accountType": m.group(1),
+            "method": m.group(2),
+            "account": m.group(3),
+            "routing": m.group(4),
+            "amount": _num(m.group(5)),
+        })
+    return out
+
+
+def _parse_deposits_summary(text: str) -> list[dict[str, Any]]:
+    """The 'Deposits' summary block (account/routing/amount, no type/method)."""
+    block = re.search(
+        r"Deposits\s*\n\s*account number transit/ABA amount\s*\n(.*?)(?=Important Notes|$)",
+        text,
+        re.DOTALL,
     )
-    if not m:
-        return {"accountType": "", "method": "", "account": "", "routing": "", "amount": None}
+    if not block:
+        return []
+    out: list[dict[str, Any]] = []
+    row_re = re.compile(rf"^(X+\d+)\s+(X+)\s+({_AMOUNT})\s*$")
+    for line in block.group(1).splitlines():
+        m = row_re.match(line.strip())
+        if m:
+            out.append({"account": m.group(1), "routing": m.group(2), "amount": _num(m.group(3))})
+    return out
+
+
+def _parse_tax_settings(text: str) -> dict[str, dict[str, str]]:
+    """Exemptions/Allowances and Tax Override, each with Federal/State/Local values."""
+    fed = re.search(r"Federal:[ \t]*([^\n]*?)[ \t]+Federal:[ \t]*([^\n]*)", text)
+    state = re.search(r"State:[ \t]*([^\n]*?)[ \t]+State:[ \t]*([^\n]*)", text)
+    local = re.search(r"Local:[ \t]*([^\n]*?)[ \t]+Local:[ \t]*([^\n]*)", text)
     return {
-        "accountType": m.group(1),
-        "method": m.group(2),
-        "account": m.group(3),
-        "routing": m.group(4),
-        "amount": _num(m.group(5)),
+        "exemptions": {
+            "federal": fed.group(1).strip() if fed else "",
+            "state": state.group(1).strip() if state else "",
+            "local": local.group(1).strip() if local else "",
+        },
+        "taxOverride": {
+            "federal": fed.group(2).strip() if fed else "",
+            "state": state.group(2).strip() if state else "",
+            "local": local.group(2).strip() if local else "",
+        },
     }
 
 
-def parse_paystub(data: bytes) -> dict[str, Any]:
-    text = _extract_text(data)
+def _parse_important_notes(text: str) -> str:
+    m = re.search(r"Important Notes\s*\n(.*?)$", text, re.DOTALL)
+    return m.group(1).strip() if m else ""
 
+
+def _parse_paystub_text(text: str) -> dict[str, Any]:
     period_start = _search(r"Period Starting:\s*([\d/]+)", text)
     period_end = _search(r"Period Ending:\s*([\d/]+)", text)
     pay_date = _search(r"Pay Date:\s*([\d/]+)", text)
     filing_status = _search(r"Taxable Filing Status:\s*([A-Za-z ]+)", text)
+    ssn = _search(r"Social Security Number:\s*([\dX\-]+)", text)
 
-    gross_match = re.search(rf"Gross Pay\s+\$?({_AMOUNT})\s+\$?({_AMOUNT})", text)
+    gross_match = re.search(rf"Gross Pay\s*\$?({_AMOUNT})\s*\$?({_AMOUNT})", text)
     gross_this = _num(gross_match.group(1)) if gross_match else None
     gross_ytd = _num(gross_match.group(2)) if gross_match else None
 
@@ -193,18 +280,35 @@ def parse_paystub(data: bytes) -> dict[str, Any]:
 
     federal_taxable = _num(_search(rf"federal taxable wages this period are\s+\$?({_AMOUNT})", text, re.IGNORECASE))
 
+    tax = _parse_tax_settings(text)
+
     return {
         "company": _parse_company(text),
         "employee": _parse_employee(text),
+        "ssn": ssn,
         "periodStart": period_start,
         "periodEnd": period_end,
         "payDate": pay_date,
         "filingStatus": filing_status,
+        "exemptions": tax["exemptions"],
+        "taxOverride": tax["taxOverride"],
         "earnings": _parse_earnings(text),
         "grossPay": gross_this,
         "grossPayYtd": gross_ytd,
         "deductions": _parse_deductions(text),
         "netPay": net_pay,
         "federalTaxableWages": federal_taxable,
-        "deposit": _parse_deposit(text),
+        "deposits": _parse_deposits(text),
+        "depositsSummary": _parse_deposits_summary(text),
+        "importantNotes": _parse_important_notes(text),
+        "rawText": text,
     }
+
+
+def parse_paystub(data: bytes) -> dict[str, Any]:
+    return _parse_paystub_text(_extract_text(data))
+
+
+def parse_paystubs(data: bytes) -> list[dict[str, Any]]:
+    """Parse a multi-page PDF as one paystub per page."""
+    return [_parse_paystub_text(text) for text in _extract_pages(data) if text.strip()]

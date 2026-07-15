@@ -16,42 +16,65 @@ type DeductionRow = {
   ytd: number | null;
 };
 
+type DepositRow = {
+  accountType: string;
+  method: string;
+  account: string;
+  routing: string;
+  amount: number | null;
+};
+
+type DepositSummaryRow = { account: string; routing: string; amount: number | null };
+
 type PaystubData = {
-  company: { code: string; name: string; address: string };
+  company: {
+    code: string;
+    locDept: string;
+    fileNumber: string;
+    page: string;
+    name: string;
+    addressLines: string[];
+    cityStateZip: string;
+  };
   employee: { name: string; address1: string; address2: string; cityStateZip: string };
+  ssn: string;
   periodStart: string;
   periodEnd: string;
   payDate: string;
   filingStatus: string;
+  exemptions: { federal: string; state: string; local: string };
+  taxOverride: { federal: string; state: string; local: string };
   earnings: EarningRow[];
   grossPay: number | null;
   grossPayYtd: number | null;
   deductions: DeductionRow[];
   netPay: number | null;
   federalTaxableWages: number | null;
-  deposit: {
-    accountType: string;
-    method: string;
-    account: string;
-    routing: string;
-    amount: number | null;
-  };
+  deposits: DepositRow[];
+  depositsSummary: DepositSummaryRow[];
+  importantNotes: string;
+  rawText?: string;
 };
 
 const EMPTY: PaystubData = {
-  company: { code: "", name: "", address: "" },
+  company: { code: "", locDept: "", fileNumber: "", page: "", name: "", addressLines: [], cityStateZip: "" },
   employee: { name: "", address1: "", address2: "", cityStateZip: "" },
+  ssn: "",
   periodStart: "",
   periodEnd: "",
   payDate: "",
   filingStatus: "",
+  exemptions: { federal: "", state: "", local: "" },
+  taxOverride: { federal: "", state: "", local: "" },
   earnings: [],
   grossPay: null,
   grossPayYtd: null,
   deductions: [],
   netPay: null,
   federalTaxableWages: null,
-  deposit: { accountType: "", method: "", account: "", routing: "", amount: null },
+  deposits: [],
+  depositsSummary: [],
+  importantNotes: "",
 };
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -60,12 +83,15 @@ const fmt = (n: number | null) =>
   n == null ? "" : n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 export default function PaystubPage() {
-  const [data, setData] = useState<PaystubData>(EMPTY);
+  const [stubs, setStubs] = useState<PaystubData[]>([]);
+  const [index, setIndex] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [status, setStatus] = useState("");
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  const data: PaystubData = stubs[index] ?? EMPTY;
 
   const upload = useCallback(async (file: File) => {
     setError("");
@@ -78,14 +104,20 @@ export default function PaystubPage() {
     try {
       const fd = new FormData();
       fd.append("file", file);
-      const res = await fetch(`${API}/parse/paystub`, { method: "POST", body: fd });
+      const res = await fetch(`${API}/parse/paystubs`, { method: "POST", body: fd });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.detail || `Request failed (${res.status})`);
       }
-      const parsed: PaystubData = await res.json();
-      setData({ ...EMPTY, ...parsed });
-      setStatus("Paystub parsed — review fields below.");
+      const json = await res.json();
+      const parsed: PaystubData[] = (json.paystubs || []).map((p: PaystubData) => ({ ...EMPTY, ...p }));
+      if (parsed.length === 0) {
+        setError("No paystubs found in PDF.");
+        return;
+      }
+      setStubs(parsed);
+      setIndex(0);
+      setStatus(`Parsed ${parsed.length} paystub${parsed.length === 1 ? "" : "s"} — review below.`);
     } catch (e: any) {
       setError(e.message || "Upload failed");
     } finally {
@@ -100,6 +132,35 @@ export default function PaystubPage() {
     if (file) upload(file);
   };
 
+  const setData = (updater: (d: PaystubData) => PaystubData) =>
+    setStubs((list) => list.map((s, i) => (i === index ? updater(s) : s)));
+
+  const downloadPdf = async () => {
+    setError("");
+    try {
+      const res = await fetch(`${API}/render/paystub`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `Render failed (${res.status})`);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `paystub-${data.payDate || index + 1}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e: any) {
+      setError(e.message || "Download failed");
+    }
+  };
+
   const setField = <K extends keyof PaystubData>(key: K, value: PaystubData[K]) =>
     setData((d) => ({ ...d, [key]: value }));
 
@@ -108,6 +169,52 @@ export default function PaystubPage() {
 
   const setEmployee = (k: keyof PaystubData["employee"]) => (e: React.ChangeEvent<HTMLInputElement>) =>
     setData((d) => ({ ...d, employee: { ...d.employee, [k]: e.target.value } }));
+
+  const parseNum = (v: string): number | null => {
+    const cleaned = v.replace(/[,$\s]/g, "");
+    if (cleaned === "" || cleaned === "-") return null;
+    const n = Number(cleaned);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  const updateEarning = (i: number, k: keyof EarningRow, v: string) =>
+    setData((d) => ({
+      ...d,
+      earnings: d.earnings.map((r, j) =>
+        j === i ? { ...r, [k]: k === "label" ? v : parseNum(v) } : r
+      ),
+    }));
+
+  const updateDeduction = (i: number, k: keyof DeductionRow, v: string) =>
+    setData((d) => ({
+      ...d,
+      deductions: d.deductions.map((r, j) =>
+        j === i ? { ...r, [k]: k === "label" ? v : parseNum(v) } : r
+      ),
+    }));
+
+  const updateDeposit = (i: number, k: keyof DepositRow, v: string) =>
+    setData((d) => ({
+      ...d,
+      deposits: d.deposits.map((r, j) =>
+        j === i ? { ...r, [k]: k === "amount" ? parseNum(v) : v } : r
+      ),
+    }));
+
+  const addEarning = () =>
+    setData((d) => ({ ...d, earnings: [...d.earnings, { label: "", rate: null, hours: null, thisPeriod: null, ytd: null }] }));
+  const removeEarning = (i: number) =>
+    setData((d) => ({ ...d, earnings: d.earnings.filter((_, j) => j !== i) }));
+
+  const addDeduction = () =>
+    setData((d) => ({ ...d, deductions: [...d.deductions, { label: "", thisPeriod: null, ytd: null }] }));
+  const removeDeduction = (i: number) =>
+    setData((d) => ({ ...d, deductions: d.deductions.filter((_, j) => j !== i) }));
+
+  const addDeposit = () =>
+    setData((d) => ({ ...d, deposits: [...d.deposits, { accountType: "", method: "", account: "", routing: "", amount: null }] }));
+  const removeDeposit = (i: number) =>
+    setData((d) => ({ ...d, deposits: d.deposits.filter((_, j) => j !== i) }));
 
   return (
     <main>
@@ -141,6 +248,18 @@ export default function PaystubPage() {
         {status && <div className="status">{status}</div>}
       </div>
 
+      {stubs.length > 1 && (
+        <div className="card" style={{ display: "flex", alignItems: "center", gap: 12, justifyContent: "space-between" }}>
+          <button type="button" className="secondary" disabled={index === 0} onClick={() => setIndex((i) => Math.max(0, i - 1))}>
+            ← Previous
+          </button>
+          <strong>Paystub {index + 1} of {stubs.length}</strong>
+          <button type="button" disabled={index >= stubs.length - 1} onClick={() => setIndex((i) => Math.min(stubs.length - 1, i + 1))}>
+            Next →
+          </button>
+        </div>
+      )}
+
       <form className="card" onSubmit={(e) => { e.preventDefault(); console.log("paystub", data); setStatus("Submitted (see console)."); }}>
         <div className="subhead">Pay period</div>
         <div className="row-3">
@@ -173,15 +292,75 @@ export default function PaystubPage() {
             <input value={data.company.code} onChange={setCompany("code")} />
           </div>
         </div>
+        <div className="row">
+          <div className="field">
+            <label>Loc/Dept</label>
+            <input value={data.company.locDept} onChange={setCompany("locDept")} />
+          </div>
+          <div className="field">
+            <label>Number</label>
+            <input value={data.company.fileNumber} onChange={setCompany("fileNumber")} />
+          </div>
+        </div>
         <div className="field">
-          <label>Address</label>
-          <input value={data.company.address} onChange={setCompany("address")} />
+          <label>Address (one line per row)</label>
+          <textarea
+            rows={2}
+            value={(data.company.addressLines || []).join("\n")}
+            onChange={(e) => setData((d) => ({ ...d, company: { ...d.company, addressLines: e.target.value.split("\n") } }))}
+          />
+        </div>
+        <div className="row">
+          <div className="field">
+            <label>City, State ZIP</label>
+            <input value={data.company.cityStateZip} onChange={setCompany("cityStateZip")} />
+          </div>
+          <div className="field">
+            <label>Page</label>
+            <input value={data.company.page} onChange={setCompany("page")} />
+          </div>
+        </div>
+
+        <div className="subhead">Tax</div>
+        <div className="row-3">
+          <div className="field">
+            <label>Exemptions — Federal</label>
+            <input value={data.exemptions.federal} onChange={(e) => setData((d) => ({ ...d, exemptions: { ...d.exemptions, federal: e.target.value } }))} />
+          </div>
+          <div className="field">
+            <label>Exemptions — State</label>
+            <input value={data.exemptions.state} onChange={(e) => setData((d) => ({ ...d, exemptions: { ...d.exemptions, state: e.target.value } }))} />
+          </div>
+          <div className="field">
+            <label>Exemptions — Local</label>
+            <input value={data.exemptions.local} onChange={(e) => setData((d) => ({ ...d, exemptions: { ...d.exemptions, local: e.target.value } }))} />
+          </div>
+        </div>
+        <div className="row-3">
+          <div className="field">
+            <label>Tax Override — Federal</label>
+            <input value={data.taxOverride.federal} onChange={(e) => setData((d) => ({ ...d, taxOverride: { ...d.taxOverride, federal: e.target.value } }))} />
+          </div>
+          <div className="field">
+            <label>Tax Override — State</label>
+            <input value={data.taxOverride.state} onChange={(e) => setData((d) => ({ ...d, taxOverride: { ...d.taxOverride, state: e.target.value } }))} />
+          </div>
+          <div className="field">
+            <label>Tax Override — Local</label>
+            <input value={data.taxOverride.local} onChange={(e) => setData((d) => ({ ...d, taxOverride: { ...d.taxOverride, local: e.target.value } }))} />
+          </div>
         </div>
 
         <div className="subhead">Employee</div>
-        <div className="field">
-          <label>Name</label>
-          <input value={data.employee.name} onChange={setEmployee("name")} />
+        <div className="row">
+          <div className="field">
+            <label>Name</label>
+            <input value={data.employee.name} onChange={setEmployee("name")} />
+          </div>
+          <div className="field">
+            <label>SSN</label>
+            <input value={data.ssn} onChange={(e) => setField("ssn", e.target.value)} />
+          </div>
         </div>
         <div className="row">
           <div className="field">
@@ -199,101 +378,116 @@ export default function PaystubPage() {
         </div>
 
         <div className="subhead">Earnings</div>
-        {data.earnings.length === 0 ? (
-          <p style={{ color: "#6b7280", fontSize: 14 }}>No earnings lines parsed.</p>
-        ) : (
-          <table className="lines">
-            <thead>
-              <tr>
-                <th>Type</th>
-                <th>Rate</th>
-                <th>Hours</th>
-                <th>This Period</th>
-                <th>YTD</th>
+        <table className="lines">
+          <thead>
+            <tr>
+              <th>Type</th>
+              <th>Rate</th>
+              <th>Hours</th>
+              <th>This Period</th>
+              <th>YTD</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {data.earnings.map((row, i) => (
+              <tr key={i}>
+                <td><input value={row.label} onChange={(e) => updateEarning(i, "label", e.target.value)} /></td>
+                <td><input className="num" value={row.rate ?? ""} onChange={(e) => updateEarning(i, "rate", e.target.value)} /></td>
+                <td><input className="num" value={row.hours ?? ""} onChange={(e) => updateEarning(i, "hours", e.target.value)} /></td>
+                <td><input className="num" value={row.thisPeriod ?? ""} onChange={(e) => updateEarning(i, "thisPeriod", e.target.value)} /></td>
+                <td><input className="num" value={row.ytd ?? ""} onChange={(e) => updateEarning(i, "ytd", e.target.value)} /></td>
+                <td><button type="button" className="secondary" onClick={() => removeEarning(i)}>×</button></td>
               </tr>
-            </thead>
-            <tbody>
-              {data.earnings.map((row, i) => (
-                <tr key={i}>
-                  <td>{row.label}</td>
-                  <td className="num">{fmt(row.rate)}</td>
-                  <td className="num">{fmt(row.hours)}</td>
-                  <td className="num">{fmt(row.thisPeriod)}</td>
-                  <td className="num">{fmt(row.ytd)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+            ))}
+          </tbody>
+        </table>
+        <button type="button" className="secondary" onClick={addEarning} style={{ marginTop: 6 }}>+ Add earning</button>
 
         <div className="row" style={{ marginTop: 12 }}>
           <div className="field">
             <label>Gross Pay (this period)</label>
-            <input value={fmt(data.grossPay)} onChange={(e) => setField("grossPay", Number(e.target.value) || null)} />
+            <input value={data.grossPay ?? ""} onChange={(e) => setField("grossPay", parseNum(e.target.value))} />
           </div>
           <div className="field">
             <label>Gross Pay (YTD)</label>
-            <input value={fmt(data.grossPayYtd)} onChange={(e) => setField("grossPayYtd", Number(e.target.value) || null)} />
+            <input value={data.grossPayYtd ?? ""} onChange={(e) => setField("grossPayYtd", parseNum(e.target.value))} />
           </div>
         </div>
 
         <div className="subhead">Statutory Deductions</div>
-        {data.deductions.length === 0 ? (
-          <p style={{ color: "#6b7280", fontSize: 14 }}>No deductions parsed.</p>
-        ) : (
-          <table className="lines">
-            <thead>
-              <tr>
-                <th>Label</th>
-                <th>This Period</th>
-                <th>YTD</th>
+        <table className="lines">
+          <thead>
+            <tr>
+              <th>Label</th>
+              <th>This Period</th>
+              <th>YTD</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {data.deductions.map((row, i) => (
+              <tr key={i}>
+                <td><input value={row.label} onChange={(e) => updateDeduction(i, "label", e.target.value)} /></td>
+                <td><input className="num" value={row.thisPeriod ?? ""} onChange={(e) => updateDeduction(i, "thisPeriod", e.target.value)} /></td>
+                <td><input className="num" value={row.ytd ?? ""} onChange={(e) => updateDeduction(i, "ytd", e.target.value)} /></td>
+                <td><button type="button" className="secondary" onClick={() => removeDeduction(i)}>×</button></td>
               </tr>
-            </thead>
-            <tbody>
-              {data.deductions.map((row, i) => (
-                <tr key={i}>
-                  <td>{row.label}</td>
-                  <td className="num">{fmt(row.thisPeriod)}</td>
-                  <td className="num">{fmt(row.ytd)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+            ))}
+          </tbody>
+        </table>
+        <button type="button" className="secondary" onClick={addDeduction} style={{ marginTop: 6 }}>+ Add deduction</button>
 
         <div className="row" style={{ marginTop: 12 }}>
           <div className="field">
             <label>Net Pay</label>
-            <input value={fmt(data.netPay)} onChange={(e) => setField("netPay", Number(e.target.value) || null)} />
+            <input value={data.netPay ?? ""} onChange={(e) => setField("netPay", parseNum(e.target.value))} />
           </div>
           <div className="field">
             <label>Federal Taxable Wages (this period)</label>
             <input
-              value={fmt(data.federalTaxableWages)}
-              onChange={(e) => setField("federalTaxableWages", Number(e.target.value) || null)}
+              value={data.federalTaxableWages ?? ""}
+              onChange={(e) => setField("federalTaxableWages", parseNum(e.target.value))}
             />
           </div>
         </div>
 
         <div className="subhead">Direct Deposit</div>
-        <div className="row-3">
-          <div className="field">
-            <label>Account Type</label>
-            <input value={data.deposit.accountType} onChange={(e) => setData((d) => ({ ...d, deposit: { ...d.deposit, accountType: e.target.value } }))} />
-          </div>
-          <div className="field">
-            <label>Account</label>
-            <input value={data.deposit.account} onChange={(e) => setData((d) => ({ ...d, deposit: { ...d.deposit, account: e.target.value } }))} />
-          </div>
-          <div className="field">
-            <label>Amount</label>
-            <input value={fmt(data.deposit.amount)} onChange={(e) => setData((d) => ({ ...d, deposit: { ...d.deposit, amount: Number(e.target.value) || null } }))} />
-          </div>
+        <table className="lines">
+          <thead>
+            <tr>
+              <th>Account Type</th>
+              <th>Method</th>
+              <th>Account</th>
+              <th>Transit/ABA</th>
+              <th>Amount</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {data.deposits.map((row, i) => (
+              <tr key={i}>
+                <td><input value={row.accountType} onChange={(e) => updateDeposit(i, "accountType", e.target.value)} /></td>
+                <td><input value={row.method} onChange={(e) => updateDeposit(i, "method", e.target.value)} /></td>
+                <td><input value={row.account} onChange={(e) => updateDeposit(i, "account", e.target.value)} /></td>
+                <td><input value={row.routing} onChange={(e) => updateDeposit(i, "routing", e.target.value)} /></td>
+                <td><input className="num" value={row.amount ?? ""} onChange={(e) => updateDeposit(i, "amount", e.target.value)} /></td>
+                <td><button type="button" className="secondary" onClick={() => removeDeposit(i)}>×</button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <button type="button" className="secondary" onClick={addDeposit} style={{ marginTop: 6 }}>+ Add deposit</button>
+
+        <div className="subhead">Important Notes</div>
+        <div className="field">
+          <textarea rows={2} value={data.importantNotes} onChange={(e) => setField("importantNotes", e.target.value)} />
         </div>
 
         <div className="actions">
           <button type="submit">Submit</button>
-          <button type="button" className="secondary" onClick={() => setData(EMPTY)}>Clear</button>
+          <button type="button" onClick={downloadPdf} disabled={loading || stubs.length === 0}>Download PDF</button>
+          <button type="button" className="secondary" onClick={() => { setStubs([]); setIndex(0); setStatus(""); }}>Clear</button>
         </div>
       </form>
     </main>
