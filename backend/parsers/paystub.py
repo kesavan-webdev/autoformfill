@@ -49,7 +49,7 @@ def _search(pattern: str, text: str, flags: int = 0) -> str:
     return m.group(1).strip() if m else ""
 
 
-_REPEAT_RE = re.compile(r"(.{3,}?)\1+")
+_REPEAT_RE = re.compile(r"(.{4,}?)\1+")
 
 
 def _collapse_repeats(text: str) -> str:
@@ -58,9 +58,15 @@ def _collapse_repeats(text: str) -> str:
     Why: pypdf's extract_text() concatenates overlapping text layers on ADP paystubs,
     producing runs like 'Gross Pay $5,016.00$5,016.00$5,016.00$5,016.00 $44,664.00'
     which breaks value regexes that expect a single this-period + a single YTD amount.
-    Requiring a minimum repeat length of 3 avoids collapsing legitimate digit runs.
+    Skip patterns that are a single character repeated (e.g. 'XXXXXXXXX' routing masks)
+    so we don't shrink legitimate single-char runs.
     """
-    return _REPEAT_RE.sub(r"\1", text)
+    def _sub(m: re.Match) -> str:
+        unit = m.group(1)
+        if len(set(unit)) == 1:
+            return m.group(0)
+        return unit
+    return _REPEAT_RE.sub(_sub, text)
 
 
 def _extract_text(data: bytes) -> str:
